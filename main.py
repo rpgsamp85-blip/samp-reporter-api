@@ -11,7 +11,6 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024
 
 logging.basicConfig(level=logging.INFO)
-
 client = Client()
 
 
@@ -22,28 +21,38 @@ def ask_ai(prompt):
             {
                 "role": "system",
                 "content": (
-                    "Ты профессиональный помощник редактора. "
-                    "Отвечай на русском языке. "
+                    "Ты профессиональный редактор. "
+                    "Отвечай только на русском языке. "
                     "Не добавляй лишних объяснений."
                 )
             },
-            {
-                "role": "user",
-                "content": prompt
-            }
+            {"role": "user", "content": prompt}
         ],
         web_search=False
     )
 
     result = response.choices[0].message.content
 
-    if not result or not result.strip():
+    if not isinstance(result, str) or not result.strip():
         raise ValueError("AI returned an empty response")
 
-    return result.strip()
+    result = result.strip()
+
+    unwanted = [
+        "copilot moved to a new app",
+        "install the new copilot app",
+        "your copilot history and content",
+        "sign in with the same account",
+        "install now"
+    ]
+
+    if any(word in result.lower() for word in unwanted):
+        raise ValueError("AI provider returned unrelated content")
+
+    return result
 
 
-@app.route("/", methods=["GET"])
+@app.route("/", methods=["GET", "POST"])
 def home():
     return jsonify({
         "status": "online",
@@ -91,11 +100,11 @@ def check_grammar():
             "corrected": corrected
         })
 
-    except Exception as e:
+    except Exception:
         app.logger.exception("Grammar error")
         return jsonify({
             "status": "error",
-            "message": str(e)[:500]
+            "message": "Не удалось получить ответ ИИ. Проверь Railway Deploy Logs."
         }), 502
 
 
@@ -141,29 +150,29 @@ def generate_pr():
         end = raw.rfind("}")
 
         if start == -1 or end == -1:
-            raise ValueError("AI вернул неправильный JSON")
+            raise ValueError("AI returned invalid JSON")
 
         result = json.loads(raw[start:end + 1])
         templates = result.get("templates")
 
         if not isinstance(templates, list) or len(templates) != 3:
-            raise ValueError("AI не вернул три объявления")
+            raise ValueError("AI did not return exactly 3 templates")
 
         templates = [str(item).strip() for item in templates]
 
         if not all(templates):
-            raise ValueError("Пустой вариант объявления")
+            raise ValueError("AI returned an empty template")
 
         return jsonify({
             "status": "success",
             "templates": templates
         })
 
-    except Exception as e:
+    except Exception:
         app.logger.exception("PR generation error")
         return jsonify({
             "status": "error",
-            "message": str(e)[:500]
+            "message": "Не удалось создать объявления. Проверь Railway Deploy Logs."
         }), 502
 
 
