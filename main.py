@@ -4,10 +4,11 @@ import re
 import logging
 
 from flask import Flask, request, jsonify
-from openai import OpenAI
+from google import genai
+from google.genai import types
 
 # =====================================
-# REPORTER HELPER AI
+# REPORTER HELPER AI - GEMINI
 # =====================================
 
 app = Flask(__name__)
@@ -17,7 +18,15 @@ app.json.ensure_ascii = False
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+SYSTEM_INSTRUCTION = (
+    "Ты помощник редактора SAMP. "
+    "Отвечай только на русском языке. "
+    "Точно выполняй задачу пользователя. "
+    "Не добавляй рекламу, ссылки и постороннюю информацию. "
+    "Не придумывай факты, имена и числа."
+)
 
 
 # =====================================
@@ -32,40 +41,37 @@ def json_response(data, status=200):
 
 
 # =====================================
-# OPENAI REQUEST
+# GEMINI REQUEST
 # =====================================
 
 def ask_ai(prompt):
-    api_key = os.getenv("OPENAI_API_KEY")
+    api_key = os.getenv("GEMINI_API_KEY")
 
     if not api_key:
-        raise RuntimeError("OPENAI_API_KEY не настроен в Railway")
+        raise RuntimeError("GEMINI_API_KEY не настроен в Railway")
 
-    client = OpenAI(
-        api_key=api_key,
-        timeout=45.0,
-        max_retries=2
-    )
+    client = genai.Client(api_key=api_key)
 
-    response = client.responses.create(
-        model=MODEL,
-        instructions=(
-            "Ты помощник редактора SAMP. "
-            "Отвечай только на русском языке. "
-            "Точно выполняй задачу пользователя. "
-            "Не добавляй рекламу, ссылки и постороннюю информацию. "
-            "Не придумывай факты, имена и числа."
-        ),
-        input=prompt,
-        max_output_tokens=1800
-    )
+    try:
+        response = client.models.generate_content(
+            model=MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_INSTRUCTION,
+                max_output_tokens=1800,
+                temperature=0.3
+            )
+        )
 
-    result = response.output_text
+        result = response.text
 
-    if not result or not result.strip():
-        raise RuntimeError("OpenAI вернул пустой ответ")
+        if not result or not result.strip():
+            raise RuntimeError("Gemini вернул пустой ответ")
 
-    return result.strip()
+        return result.strip()
+
+    finally:
+        client.close()
 
 
 # =====================================
@@ -128,7 +134,7 @@ def check_grammar():
 
         return json_response({
             "status": "error",
-            "message": "Не удалось проверить текст. Попробуй позже."
+            "message": "Не удалось проверить текст. Проверь логи Railway."
         }, 502)
 
 
@@ -183,7 +189,7 @@ def generate_pr():
 9. Каждый вариант должен быть отдельным сообщением.
 10. Не добавляй объяснения.
 
-Разделяй варианты отдельной строкой с тремя дефисами:
+Разделяй варианты отдельной строкой ровно с тремя дефисами:
 ---
 
 Верни ровно 3 варианта.
@@ -212,7 +218,7 @@ def generate_pr():
 
         return json_response({
             "status": "error",
-            "message": "Не удалось создать пиар. Попробуй позже."
+            "message": "Не удалось создать пиар. Проверь логи Railway."
         }, 502)
 
 
