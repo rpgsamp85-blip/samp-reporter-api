@@ -2,12 +2,15 @@
 import os
 import json
 import re
+import logging
 
 from flask import Flask, jsonify, request
 from g4f.client import Client
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024
+
+logging.basicConfig(level=logging.INFO)
 
 client = Client()
 
@@ -20,7 +23,7 @@ def ask_ai(prompt):
                 "role": "system",
                 "content": (
                     "Ты профессиональный помощник редактора. "
-                    "Отвечай только на русском языке. "
+                    "Отвечай на русском языке. "
                     "Не добавляй лишних объяснений."
                 )
             },
@@ -35,12 +38,12 @@ def ask_ai(prompt):
     result = response.choices[0].message.content
 
     if not result or not result.strip():
-        raise ValueError("ИИ вернул пустой ответ")
+        raise ValueError("AI returned an empty response")
 
     return result.strip()
 
 
-@app.route("/", methods=["GET", "POST"])
+@app.route("/", methods=["GET"])
 def home():
     return jsonify({
         "status": "online",
@@ -57,13 +60,13 @@ def check_grammar():
         if not isinstance(text, str) or not text.strip():
             return jsonify({
                 "status": "error",
-                "message": "Empty text provided"
+                "message": "Введите текст"
             }), 400
 
         if len(text) > 5000:
             return jsonify({
                 "status": "error",
-                "message": "Text is too long"
+                "message": "Текст слишком длинный"
             }), 400
 
         prompt = f"""
@@ -90,10 +93,9 @@ def check_grammar():
 
     except Exception as e:
         app.logger.exception("Grammar error")
-
         return jsonify({
             "status": "error",
-            "message": "AI processing failed"
+            "message": str(e)[:500]
         }), 502
 
 
@@ -111,7 +113,7 @@ def generate_pr():
 Ты профессиональный автор рекламных объявлений
 для игрового проекта SAMP.
 
-Создай ровно 3 РАЗНЫХ варианта рекламного объявления.
+Создай ровно 3 разных рекламных объявления.
 
 Информация:
 Спонсор: {name}
@@ -122,59 +124,49 @@ def generate_pr():
 Требования:
 - Свободный рекламный стиль.
 - Красивые и привлекательные формулировки.
-- Разнообразие между тремя вариантами.
-- Используй всю предоставленную информацию.
+- Все три варианта должны отличаться.
+- Используй предоставленную информацию.
 - Можно использовать эмодзи и восклицательные знаки.
 - Не придумывай дополнительные призы.
 - Объявления должны быть готовы к публикации в чате SAMP.
 
-Верни исключительно JSON следующего формата:
+Верни исключительно JSON:
 {{"templates": ["Вариант 1", "Вариант 2", "Вариант 3"]}}
 """
 
         raw = ask_ai(prompt)
-
-        # Удаляем возможные Markdown-ограждения
         raw = re.sub(r"```(?:json)?", "", raw).strip()
 
-        # Извлекаем JSON
         start = raw.find("{")
         end = raw.rfind("}")
 
         if start == -1 or end == -1:
-            raise ValueError("Invalid AI JSON response")
+            raise ValueError("AI вернул неправильный JSON")
 
         result = json.loads(raw[start:end + 1])
         templates = result.get("templates")
 
         if not isinstance(templates, list) or len(templates) != 3:
-            raise ValueError("AI did not return 3 templates")
+            raise ValueError("AI не вернул три объявления")
 
-        templates = [
-            str(item).strip()
-            for item in templates
-        ]
+        templates = [str(item).strip() for item in templates]
 
         if not all(templates):
-            raise ValueError("Empty advertisement template")
+            raise ValueError("Пустой вариант объявления")
 
         return jsonify({
             "status": "success",
             "templates": templates
         })
 
-    except Exception:
-        app.logger.exception("Advertisement generation error")
-
+    except Exception as e:
+        app.logger.exception("PR generation error")
         return jsonify({
             "status": "error",
-            "message": "AI generation failed"
+            "message": str(e)[:500]
         }), 502
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    app.run(
-        host="0.0.0.0",
-        port=port
-    )
+    app.run(host="0.0.0.0", port=port)
