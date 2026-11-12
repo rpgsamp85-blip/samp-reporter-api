@@ -18,7 +18,7 @@ app.json.ensure_ascii = False
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
 SYSTEM_INSTRUCTION = (
     "Ты помощник редактора SAMP. "
@@ -134,7 +134,7 @@ def check_grammar():
 
         return json_response({
             "status": "error",
-            "message": "Не удалось проверить текст. Проверь логи Railway."
+            "message": "Не удалось проверить текст. Попробуй позже."
         }, 502)
 
 
@@ -189,7 +189,7 @@ def generate_pr():
 9. Каждый вариант должен быть отдельным сообщением.
 10. Не добавляй объяснения.
 
-Разделяй варианты отдельной строкой ровно с тремя дефисами:
+Разделяй варианты отдельной строкой с тремя дефисами:
 ---
 
 Верни ровно 3 варианта.
@@ -218,7 +218,7 @@ def generate_pr():
 
         return json_response({
             "status": "error",
-            "message": "Не удалось создать пиар. Проверь логи Railway."
+            "message": "Не удалось создать пиар. Попробуй позже."
         }, 502)
 
 
