@@ -2,6 +2,7 @@
 import os
 import time
 import logging
+import re
 
 from flask import Flask, request, jsonify
 from g4f.client import Client
@@ -38,7 +39,7 @@ def json_response(data, status=200):
 def ask_ai(prompt):
     last_error = None
 
-    for attempt in range(2):
+    for attempt in range(3):
         try:
             response = client.chat.completions.create(
                 model="auto",
@@ -47,9 +48,10 @@ def ask_ai(prompt):
                         "role": "system",
                         "content": (
                             "Ты помощник редактора SAMP. "
-                            "Отвечай только на русском языке. "
-                            "Не добавляй рекламу, ссылки и постороннюю информацию. "
-                            "Точно выполняй задачу пользователя."
+                            "Отвечай строго на русском языке. "
+                            "Выполняй задачу пользователя. "
+                            "Не добавляй ссылки, рекламу и постороннюю информацию. "
+                            "Не меняй факты, имена и числа."
                         )
                     },
                     {
@@ -62,11 +64,16 @@ def ask_ai(prompt):
 
             result = response.choices[0].message.content
 
-            if not result or not result.strip():
+            if not isinstance(result, str) or not result.strip():
                 raise ValueError("ИИ вернул пустой ответ")
 
             result = result.strip()
 
+            # Удаляем возможные блоки Markdown
+            result = re.sub(r"^```(?:text|markdown)?\s*", "", result, flags=re.I)
+            result = re.sub(r"\s*```$", "", result)
+
+            # Проверяем явно посторонние ответы
             unwanted = [
                 "copilot moved to a new app",
                 "install now",
@@ -75,17 +82,19 @@ def ask_ai(prompt):
             ]
 
             if any(word in result.lower() for word in unwanted):
-                raise ValueError("ИИ вернул посторонний текст")
+                raise ValueError("Провайдер вернул посторонний текст")
 
-            return result
+            return result.strip()
 
         except Exception as error:
             last_error = error
             logger.exception("AI request failed, attempt %s", attempt + 1)
-            time.sleep(1)
+
+            if attempt < 2:
+                time.sleep(2)
 
     raise RuntimeError(
-        "ИИ временно недоступен. Попробуй позже."
+        "AI provider failed after 3 attempts"
     ) from last_error
 
 
@@ -133,7 +142,7 @@ def check_grammar():
         prompt = (
             "Исправь орфографию, грамматику и пунктуацию "
             "следующего текста. Сохрани исходный смысл и стиль. "
-            "Верни только исправленный текст, без объяснений:\n\n"
+            "Верни только исправленный текст:\n\n"
             + text
         )
 
@@ -149,8 +158,8 @@ def check_grammar():
 
         return json_response({
             "status": "error",
-            "message": "Не удалось проверить текст. Попробуй позже."
-        }, 502)
+            "message": "ИИ временно недоступен. Попробуй позже."
+        }, 503)
 
 
 # =====================================
@@ -180,7 +189,7 @@ def generate_pr():
             }, 400)
 
         prompt = f"""
-Создай ровно 3 разных красивых RP-пиара для сервера SAMP.
+Создай ровно 3 разных RP-пиара для сервера SAMP.
 
 ДАННЫЕ:
 Отправитель: {name}
@@ -189,27 +198,27 @@ def generate_pr():
 Фракция отправителя: {fraction}
 
 СТИЛЬ:
-Пиши как игрок, который эмоционально сообщает о поступлении
-денег на банковский счёт для мероприятия.
+Пиши как игрок, который эмоционально сообщает
+о поступлении денег на банковский счёт для мероприятия.
 
-Пример желаемого стиля:
+Пример стиля:
 "Воу!! Ко мне на банк поступил перевод от латинца
 из банды Aztecas в размере 20.000.000$!
 Деньги отправлены на МП «CS»! Вот это поддержка!"
 
 ТРЕБОВАНИЯ:
 1. Начинай варианты по-разному.
-2. Обязательно укажи отправителя и его фракцию.
+2. Укажи отправителя и его фракцию.
 3. Укажи точную сумму перевода.
 4. Укажи название мероприятия.
-5. Используй живой, естественный русский язык.
-6. Можно использовать немного эмодзи и восклицаний.
-7. Не придумывай дополнительные факты, награды или действия.
+5. Используй живой русский язык.
+6. Можно немного эмодзи и восклицаний.
+7. Не придумывай дополнительные факты.
 8. Не используй сухой официальный стиль.
 9. Каждый вариант должен быть отдельным сообщением.
-10. Не добавляй объяснения от себя.
+10. Не добавляй объяснения.
 
-Разделяй варианты строго строкой:
+Разделяй варианты строкой:
 ---
 
 Верни ровно 3 варианта.
@@ -219,12 +228,21 @@ def generate_pr():
 
         templates = [
             item.strip()
-            for item in result.split("---")
+            for item in re.split(r"\n\s*---+\s*\n", result)
             if item.strip()
         ]
 
-        if len(templates) < 2:
-            raise ValueError("ИИ вернул неправильный формат пиара")
+        # Запасной вариант разделения, если AI использовал
+        # разделитель без переносов строк
+        if len(templates) < 3:
+            templates = [
+                item.strip()
+                for item in result.split("---")
+                if item.strip()
+            ]
+
+        if len(templates) < 3:
+            raise ValueError("ИИ вернул меньше трёх вариантов пиара")
 
         return json_response({
             "status": "success",
@@ -236,8 +254,8 @@ def generate_pr():
 
         return json_response({
             "status": "error",
-            "message": "Не удалось создать пиар. Попробуй позже."
-        }, 502)
+            "message": "ИИ временно недоступен. Попробуй позже."
+        }, 503)
 
 
 # =====================================
