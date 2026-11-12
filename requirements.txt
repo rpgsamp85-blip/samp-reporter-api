@@ -1,3 +1,4 @@
-flask
-g4f
-requests
+
+Flask>=3.0
+gunicorn>=22.0
+g4f>=8.9.3
