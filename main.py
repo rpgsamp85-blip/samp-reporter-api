@@ -1,11 +1,10 @@
 
 import os
-import time
-import logging
 import re
+import logging
 
 from flask import Flask, request, jsonify
-from g4f.client import Client
+from openai import OpenAI
 
 # =====================================
 # REPORTER HELPER AI
@@ -18,7 +17,7 @@ app.json.ensure_ascii = False
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-client = Client()
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
 
 # =====================================
@@ -33,69 +32,40 @@ def json_response(data, status=200):
 
 
 # =====================================
-# AI REQUEST
+# OPENAI REQUEST
 # =====================================
 
 def ask_ai(prompt):
-    last_error = None
+    api_key = os.getenv("OPENAI_API_KEY")
 
-    for attempt in range(3):
-        try:
-            response = client.chat.completions.create(
-                model="auto",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "Ты помощник редактора SAMP. "
-                            "Отвечай строго на русском языке. "
-                            "Выполняй задачу пользователя. "
-                            "Не добавляй ссылки, рекламу и постороннюю информацию. "
-                            "Не меняй факты, имена и числа."
-                        )
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
-                web_search=False
-            )
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY не настроен в Railway")
 
-            result = response.choices[0].message.content
+    client = OpenAI(
+        api_key=api_key,
+        timeout=45.0,
+        max_retries=2
+    )
 
-            if not isinstance(result, str) or not result.strip():
-                raise ValueError("ИИ вернул пустой ответ")
+    response = client.responses.create(
+        model=MODEL,
+        instructions=(
+            "Ты помощник редактора SAMP. "
+            "Отвечай только на русском языке. "
+            "Точно выполняй задачу пользователя. "
+            "Не добавляй рекламу, ссылки и постороннюю информацию. "
+            "Не придумывай факты, имена и числа."
+        ),
+        input=prompt,
+        max_output_tokens=1800
+    )
 
-            result = result.strip()
+    result = response.output_text
 
-            # Удаляем возможные блоки Markdown
-            result = re.sub(r"^```(?:text|markdown)?\s*", "", result, flags=re.I)
-            result = re.sub(r"\s*```$", "", result)
+    if not result or not result.strip():
+        raise RuntimeError("OpenAI вернул пустой ответ")
 
-            # Проверяем явно посторонние ответы
-            unwanted = [
-                "copilot moved to a new app",
-                "install now",
-                "your copilot history",
-                "sign in with the same account"
-            ]
-
-            if any(word in result.lower() for word in unwanted):
-                raise ValueError("Провайдер вернул посторонний текст")
-
-            return result.strip()
-
-        except Exception as error:
-            last_error = error
-            logger.exception("AI request failed, attempt %s", attempt + 1)
-
-            if attempt < 2:
-                time.sleep(2)
-
-    raise RuntimeError(
-        "AI provider failed after 3 attempts"
-    ) from last_error
+    return result.strip()
 
 
 # =====================================
@@ -142,7 +112,7 @@ def check_grammar():
         prompt = (
             "Исправь орфографию, грамматику и пунктуацию "
             "следующего текста. Сохрани исходный смысл и стиль. "
-            "Верни только исправленный текст:\n\n"
+            "Верни только исправленный текст, без объяснений:\n\n"
             + text
         )
 
@@ -158,8 +128,8 @@ def check_grammar():
 
         return json_response({
             "status": "error",
-            "message": "ИИ временно недоступен. Попробуй позже."
-        }, 503)
+            "message": "Не удалось проверить текст. Попробуй позже."
+        }, 502)
 
 
 # =====================================
@@ -201,24 +171,19 @@ def generate_pr():
 Пиши как игрок, который эмоционально сообщает
 о поступлении денег на банковский счёт для мероприятия.
 
-Пример стиля:
-"Воу!! Ко мне на банк поступил перевод от латинца
-из банды Aztecas в размере 20.000.000$!
-Деньги отправлены на МП «CS»! Вот это поддержка!"
-
 ТРЕБОВАНИЯ:
-1. Начинай варианты по-разному.
-2. Укажи отправителя и его фракцию.
+1. Начинай каждый вариант по-разному.
+2. Обязательно укажи отправителя и его фракцию.
 3. Укажи точную сумму перевода.
 4. Укажи название мероприятия.
-5. Используй живой русский язык.
-6. Можно немного эмодзи и восклицаний.
+5. Используй живой, естественный русский язык.
+6. Можно использовать немного эмодзи и восклицаний.
 7. Не придумывай дополнительные факты.
 8. Не используй сухой официальный стиль.
 9. Каждый вариант должен быть отдельным сообщением.
 10. Не добавляй объяснения.
 
-Разделяй варианты строкой:
+Разделяй варианты отдельной строкой с тремя дефисами:
 ---
 
 Верни ровно 3 варианта.
@@ -228,25 +193,18 @@ def generate_pr():
 
         templates = [
             item.strip()
-            for item in re.split(r"\n\s*---+\s*\n", result)
+            for item in re.split(r"(?m)^\s*---+\s*$", result)
             if item.strip()
         ]
 
-        # Запасной вариант разделения, если AI использовал
-        # разделитель без переносов строк
-        if len(templates) < 3:
-            templates = [
-                item.strip()
-                for item in result.split("---")
-                if item.strip()
-            ]
-
-        if len(templates) < 3:
-            raise ValueError("ИИ вернул меньше трёх вариантов пиара")
+        if len(templates) != 3:
+            raise ValueError(
+                f"Ожидалось 3 варианта, получено: {len(templates)}"
+            )
 
         return json_response({
             "status": "success",
-            "templates": templates[:3]
+            "templates": templates
         })
 
     except Exception:
@@ -254,8 +212,8 @@ def generate_pr():
 
         return json_response({
             "status": "error",
-            "message": "ИИ временно недоступен. Попробуй позже."
-        }, 503)
+            "message": "Не удалось создать пиар. Попробуй позже."
+        }, 502)
 
 
 # =====================================
