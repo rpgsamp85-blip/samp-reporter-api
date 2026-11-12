@@ -1,6 +1,7 @@
 
 import os
 import re
+import time
 import logging
 
 from flask import Flask, request, jsonify
@@ -8,7 +9,7 @@ from google import genai
 from google.genai import types
 
 # =====================================
-# REPORTER HELPER AI - GEMINI
+# REPORTER HELPER AI
 # =====================================
 
 app = Flask(__name__)
@@ -18,7 +19,8 @@ app.json.ensure_ascii = False
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+MAIN_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+BACKUP_MODEL = "gemini-3.5-flash-lite"
 
 SYSTEM_INSTRUCTION = (
     "Ты помощник редактора SAMP. "
@@ -41,7 +43,7 @@ def json_response(data, status=200):
 
 
 # =====================================
-# GEMINI REQUEST
+# GEMINI REQUEST WITH FALLBACK
 # =====================================
 
 def ask_ai(prompt):
@@ -52,30 +54,66 @@ def ask_ai(prompt):
 
     client = genai.Client(api_key=api_key)
 
+    models = [MAIN_MODEL]
+
+    if BACKUP_MODEL != MAIN_MODEL:
+        models.append(BACKUP_MODEL)
+
+    last_error = None
+
     try:
-        response = client.models.generate_content(
-            model=MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_INSTRUCTION,
-                max_output_tokens=1800,
-                temperature=0.3
-            )
+        for model in models:
+            for attempt in range(2):
+                try:
+                    logger.info(
+                        "Gemini request: model=%s attempt=%s",
+                        model,
+                        attempt + 1
+                    )
+
+                    response = client.models.generate_content(
+                        model=model,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            system_instruction=SYSTEM_INSTRUCTION,
+                            max_output_tokens=1800,
+                            temperature=0.3
+                        )
+                    )
+
+                    result = response.text
+
+                    if not result or not result.strip():
+                        raise RuntimeError("Gemini вернул пустой ответ")
+
+                    logger.info("Gemini response successful: %s", model)
+
+                    return result.strip()
+
+                except Exception as error:
+                    last_error = error
+
+                    logger.exception(
+                        "Gemini failed: model=%s attempt=%s",
+                        model,
+                        attempt + 1
+                    )
+
+                    if attempt == 0:
+                        time.sleep(2)
+
+            logger.warning("Switching to backup model: %s", model)
+
+        raise RuntimeError(
+            f"Все модели Gemini недоступны: {last_error}"
         )
-
-        result = response.text
-
-        if not result or not result.strip():
-            raise RuntimeError("Gemini вернул пустой ответ")
-
-        return result.strip()
 
     finally:
         client.close()
 
 
 # =====================================
-# HOME / SERVER STATUS
+# HOME
 # =====================================
 
 @app.route("/", methods=["GET", "POST"])
@@ -134,7 +172,7 @@ def check_grammar():
 
         return json_response({
             "status": "error",
-            "message": "Не удалось проверить текст. Попробуй позже."
+            "message": "ИИ временно недоступен. Попробуй позже."
         }, 502)
 
 
@@ -173,23 +211,18 @@ def generate_pr():
 Мероприятие: {event}
 Фракция отправителя: {fraction}
 
-СТИЛЬ:
-Пиши как игрок, который эмоционально сообщает
-о поступлении денег на банковский счёт для мероприятия.
-
 ТРЕБОВАНИЯ:
 1. Начинай каждый вариант по-разному.
-2. Обязательно укажи отправителя и его фракцию.
-3. Укажи точную сумму перевода.
+2. Укажи отправителя и его фракцию.
+3. Укажи точную сумму.
 4. Укажи название мероприятия.
-5. Используй живой, естественный русский язык.
-6. Можно использовать немного эмодзи и восклицаний.
+5. Пиши естественным русским языком.
+6. Используй немного эмоций.
 7. Не придумывай дополнительные факты.
-8. Не используй сухой официальный стиль.
-9. Каждый вариант должен быть отдельным сообщением.
-10. Не добавляй объяснения.
+8. Не добавляй объяснения.
+9. Создай ровно три отдельных сообщения.
 
-Разделяй варианты отдельной строкой с тремя дефисами:
+Разделяй варианты отдельной строкой:
 ---
 
 Верни ровно 3 варианта.
@@ -218,7 +251,7 @@ def generate_pr():
 
         return json_response({
             "status": "error",
-            "message": "Не удалось создать пиар. Попробуй позже."
+            "message": "ИИ временно недоступен. Попробуй позже."
         }, 502)
 
 
