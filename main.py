@@ -21,15 +21,15 @@ MAIN_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 BACKUP_MODEL = os.getenv("GEMINI_BACKUP_MODEL", "gemini-3.5-flash-lite")
 
 TIMEOUT = 90
-executor = ThreadPoolExecutor(max_workers=4)
 
+executor = ThreadPoolExecutor(max_workers=4)
 tasks = {}
 tasks_lock = threading.Lock()
 
 SYSTEM_INSTRUCTION = """
 Ты универсальный ИИ-помощник.
 Отвечай на русском языке, если пользователь не попросил другой язык.
-Выполняй задачу точно.
+Выполняй поставленную задачу точно.
 """
 
 
@@ -57,20 +57,15 @@ def create_task(task_type):
 def get_task(task_id):
     with tasks_lock:
         task = tasks.get(task_id)
-
-        if task is None:
-            return None
-
-        return dict(task)
+        return dict(task) if task else None
 
 
-def stream_gemini(system_instruction, contents, temperature=0.8,
-                  max_tokens=2000, on_text=None):
+def stream_gemini(system_instruction, contents,
+                  temperature=0.8, max_tokens=2000,
+                  on_text=None):
+
     if not API_KEY:
-        raise RuntimeError("На сервере не задан GEMINI_API_KEY")
-
-    models = [MAIN_MODEL, BACKUP_MODEL]
-    last_error = "Не удалось получить ответ Gemini"
+        raise RuntimeError("На Railway не задан GEMINI_API_KEY")
 
     payload = {
         "systemInstruction": {
@@ -83,7 +78,9 @@ def stream_gemini(system_instruction, contents, temperature=0.8,
         }
     }
 
-    for model in models:
+    last_error = "Gemini не вернул ответ"
+
+    for model in [MAIN_MODEL, BACKUP_MODEL]:
         url = (
             "https://generativelanguage.googleapis.com/"
             f"v1beta/models/{model}:streamGenerateContent"
@@ -92,7 +89,7 @@ def stream_gemini(system_instruction, contents, temperature=0.8,
         result = ""
 
         try:
-            logger.info("Streaming Gemini request: %s", model)
+            logger.info("Gemini streaming: %s", model)
 
             with requests.post(
                 url,
@@ -105,8 +102,9 @@ def stream_gemini(system_instruction, contents, temperature=0.8,
                 if response.status_code != 200:
                     last_error = (
                         f"Gemini HTTP {response.status_code}: "
-                        f"{response.text[:400]}"
+                        f"{response.text[:300]}"
                     )
+
                     logger.error("%s", last_error)
 
                     if response.status_code in (404, 429, 500, 503):
@@ -114,7 +112,7 @@ def stream_gemini(system_instruction, contents, temperature=0.8,
 
                     raise RuntimeError(last_error)
 
-                for line in response.iter_lines(decode_unicode=True):
+                for line in response.iter_lines():
                     if not line:
                         continue
 
@@ -134,7 +132,6 @@ def stream_gemini(system_instruction, contents, temperature=0.8,
                     try:
                         packet = json.loads(raw)
                     except json.JSONDecodeError:
-                        logger.warning("Invalid Gemini stream packet")
                         continue
 
                     candidates = packet.get("candidates", [])
@@ -161,7 +158,7 @@ def stream_gemini(system_instruction, contents, temperature=0.8,
             if result:
                 return result
 
-            last_error = "Gemini вернул пустой ответ"
+            last_error = "Gemini вернул пустой текст"
 
         except requests.Timeout:
             last_error = f"Тайм-аут модели {model}"
@@ -173,20 +170,20 @@ def stream_gemini(system_instruction, contents, temperature=0.8,
 
         except Exception as exc:
             last_error = str(exc)
-            logger.exception("Gemini generation error")
+            logger.exception("Gemini error")
 
     raise RuntimeError(last_error)
 
 
-def run_task(task_id, system_instruction, contents,
-             temperature=0.8, max_tokens=2000,
-             validator=None):
+def run_task(task_id, system, contents,
+             temperature, max_tokens, validator=None):
+
     try:
-        def on_text(current_text):
-            update_task(task_id, text=current_text)
+        def on_text(text):
+            update_task(task_id, text=text)
 
         result = stream_gemini(
-            system_instruction,
+            system,
             contents,
             temperature,
             max_tokens,
@@ -196,9 +193,6 @@ def run_task(task_id, system_instruction, contents,
         if validator:
             result = validator(result)
 
-        if not isinstance(result, str) or not result.strip():
-            raise ValueError("ИИ вернул пустой текст")
-
         update_task(
             task_id,
             text=result.strip(),
@@ -206,7 +200,7 @@ def run_task(task_id, system_instruction, contents,
         )
 
     except Exception as exc:
-        logger.exception("Task %s failed", task_id)
+        logger.exception("Task failed: %s", task_id)
 
         update_task(
             task_id,
@@ -215,15 +209,16 @@ def run_task(task_id, system_instruction, contents,
         )
 
 
-def start_task(task_type, system_instruction, contents,
+def start_task(task_type, system, contents,
                temperature=0.8, max_tokens=2000,
                validator=None):
+
     task_id = create_task(task_type)
 
     executor.submit(
         run_task,
         task_id,
-        system_instruction,
+        system,
         contents,
         temperature,
         max_tokens,
@@ -234,43 +229,6 @@ def start_task(task_type, system_instruction, contents,
         "status": "success",
         "task_id": task_id
     })
-
-
-def clean_pr(text):
-    text = text.strip()
-
-    # Убираем случайные Markdown-блоки.
-    if text.startswith("```"):
-        lines = text.splitlines()
-
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-
-        text = "\n".join(lines).strip()
-
-    # Не допускаем выдачу исходного программного кода.
-    forbidden = [
-        "from flask import",
-        "import os",
-        "import requests",
-        "def generate_pr",
-        "def ask_ai",
-        "app = Flask",
-        "app.run(",
-        "def request_gemini",
-        "GEMINI_API_KEY",
-        "```python"
-    ]
-
-    lowered = text.lower()
-
-    if any(item.lower() in lowered for item in forbidden):
-        raise ValueError("Gemini вернул код вместо PR")
-
-    return text
 
 
 def error_response(message, status=502):
@@ -284,8 +242,44 @@ def get_data():
     return request.get_json(silent=True) or {}
 
 
+def clean_pr(text):
+    text = text.strip()
+
+    if text.startswith("```"):
+        lines = text.splitlines()
+        lines = lines[1:]
+
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+
+        text = "\n".join(lines).strip()
+
+    forbidden = [
+        "from flask import",
+        "import os",
+        "import requests",
+        "def generate_pr",
+        "def ask_ai",
+        "app = Flask",
+        "app.run(",
+        "def stream_gemini",
+        "GEMINI_API_KEY",
+        "```python"
+    ]
+
+    lowered = text.lower()
+
+    if any(word.lower() in lowered for word in forbidden):
+        raise ValueError("Gemini вернул код вместо PR")
+
+    if not text:
+        raise ValueError("Пустой PR")
+
+    return text
+
+
 # ==========================================
-# HOME
+# CONNECTION
 # ==========================================
 
 @app.route("/", methods=["GET", "POST"])
@@ -297,11 +291,11 @@ def home():
 
 
 # ==========================================
-# GRAMMAR
+# GRAMMAR - STREAMING TASK
 # ==========================================
 
-@app.route("/check_grammar", methods=["POST"])
-def check_grammar():
+@app.route("/check_grammar/start", methods=["POST"])
+def check_grammar_start():
     try:
         data = get_data()
         text = str(data.get("text", "")).strip()
@@ -313,38 +307,35 @@ def check_grammar():
             return error_response("Текст слишком длинный", 400)
 
         prompt = f"""
-Исправь орфографию, грамматику и пунктуацию.
+Исправь орфографию, грамматику и пунктуацию текста.
 
 Правила:
 - Сохрани первоначальный смысл.
 - Сохрани стиль автора.
 - Не добавляй новых фактов.
 - Не добавляй пояснений.
+- Не сокращай текст без необходимости.
 - Верни только исправленный текст.
 
 Текст:
 {text}
 """
 
-        result = stream_gemini(
+        return start_task(
+            "grammar",
             SYSTEM_INSTRUCTION,
             [{"role": "user", "parts": [{"text": prompt}]}],
             temperature=0.2,
             max_tokens=3000
         )
 
-        return jsonify({
-            "status": "success",
-            "corrected": result.strip()
-        })
-
     except Exception:
         logger.exception("Grammar error")
-        return error_response("Ошибка ИИ при проверке текста")
+        return error_response("Не удалось запустить проверку")
 
 
 # ==========================================
-# PR START
+# PR - STREAMING TASK
 # ==========================================
 
 @app.route("/generate_pr/start", methods=["POST"])
@@ -364,36 +355,32 @@ def generate_pr_start():
             )
 
         prompt = f"""
-Напиши готовый рекламный PR для игрового SA-MP проекта.
+Создай оригинальный PR-текст для SA-MP проекта.
 
-Исходные данные:
+Данные:
 Фракция: {fraction}
 Ник игрока: {name}
 Сумма перевода: {amount}
 Мероприятие: {event if event else "Не указано"}
 
 Требования:
-- Самостоятельно придумай оригинальную подачу.
-- Сделай красивое начало, основной текст и завершение.
-- Обязательно укажи точные ник, фракцию и сумму.
-- Добавь несколько эмоциональных, выразительных фраз.
-- Используй абзацы и естественные переносы строк.
-- Можно добавить уместные эмодзи.
-- Не выдумывай дополнительные факты.
+- Красивое и цепляющее начало.
+- Эмоциональный основной текст.
+- Обязательно укажи точный ник, сумму и фракцию.
+- Добавь несколько выразительных фраз.
+- Раздели текст на абзацы.
+- Используй уместные эмодзи.
+- Не придумывай факты.
 - Не меняй исходные данные.
-- Не используй одинаковый шаблон для каждого запроса.
-- Не пиши инструкций, пояснений или комментариев.
-- Не возвращай JSON.
-- Не возвращай программный код.
-- Не используй Markdown-блоки кода.
-
-Верни только готовый PR-текст.
+- Каждый запрос должен иметь новую оригинальную подачу.
+- Не возвращай JSON, код или пояснения.
+- Верни только готовый PR.
 """
 
         return start_task(
             "pr",
-            "Ты профессиональный автор рекламных текстов. " +
-            "Возвращай только готовый PR, без кода и пояснений.",
+            "Ты профессиональный автор PR-текстов. " +
+            "Возвращай только готовый текст.",
             [{"role": "user", "parts": [{"text": prompt}]}],
             temperature=1.0,
             max_tokens=1200,
@@ -406,7 +393,7 @@ def generate_pr_start():
 
 
 # ==========================================
-# CHAT START
+# CHAT - STREAMING TASK
 # ==========================================
 
 @app.route("/chat/start", methods=["POST"])
@@ -458,7 +445,7 @@ def chat_start():
 - Отвечай на вопросы по существу.
 - Учитывай историю разговора.
 - Помогай с Python, Lua, MoonLoader и SA-MP.
-- Не выдавай случайные заготовки.
+- Не выдумывай факты.
 - Не добавляй JSON и технические метаданные.
 - Отвечай на русском языке, если не попросили другой.
 """
@@ -477,7 +464,7 @@ def chat_start():
 
 
 # ==========================================
-# TASK STATUS / STREAM POLLING
+# TASK POLLING
 # ==========================================
 
 @app.route("/task/<task_id>", methods=["GET"])
