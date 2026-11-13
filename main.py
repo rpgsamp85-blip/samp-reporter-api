@@ -2,6 +2,7 @@
 import os
 import json
 import uuid
+import time
 import logging
 import threading
 import requests
@@ -20,7 +21,8 @@ API_KEY = os.getenv("GEMINI_API_KEY")
 MAIN_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 BACKUP_MODEL = os.getenv("GEMINI_BACKUP_MODEL", "gemini-3.5-flash-lite")
 
-TIMEOUT = 90
+TIMEOUT = 150
+TASK_TTL = 900
 
 executor = ThreadPoolExecutor(max_workers=4)
 tasks = {}
@@ -43,12 +45,23 @@ def create_task(task_type):
     task_id = str(uuid.uuid4())
 
     with tasks_lock:
+        now = time.time()
+
+        expired = [
+            key for key, value in tasks.items()
+            if now - value["created"] > TASK_TTL
+        ]
+
+        for key in expired:
+            tasks.pop(key, None)
+
         tasks[task_id] = {
             "id": task_id,
             "type": task_type,
             "status": "running",
             "text": "",
-            "error": None
+            "error": None,
+            "created": now
         }
 
     return task_id
@@ -65,7 +78,7 @@ def stream_gemini(system_instruction, contents,
                   on_text=None):
 
     if not API_KEY:
-        raise RuntimeError("На Railway не задан GEMINI_API_KEY")
+        raise RuntimeError("На сервере не задан GEMINI_API_KEY")
 
     payload = {
         "systemInstruction": {
@@ -89,7 +102,7 @@ def stream_gemini(system_instruction, contents,
         result = ""
 
         try:
-            logger.info("Gemini streaming: %s", model)
+            logger.info("Starting Gemini stream: %s", model)
 
             with requests.post(
                 url,
@@ -135,6 +148,7 @@ def stream_gemini(system_instruction, contents,
                         continue
 
                     candidates = packet.get("candidates", [])
+
                     if not candidates:
                         continue
 
@@ -150,6 +164,7 @@ def stream_gemini(system_instruction, contents,
                         if chunk:
                             result += chunk
 
+                            # Сразу обновляем текст задачи
                             if on_text:
                                 on_text(result)
 
@@ -158,7 +173,7 @@ def stream_gemini(system_instruction, contents,
             if result:
                 return result
 
-            last_error = "Gemini вернул пустой текст"
+            last_error = "Gemini вернул пустой ответ"
 
         except requests.Timeout:
             last_error = f"Тайм-аут модели {model}"
@@ -278,10 +293,6 @@ def clean_pr(text):
     return text
 
 
-# ==========================================
-# CONNECTION
-# ==========================================
-
 @app.route("/", methods=["GET", "POST"])
 def home():
     return jsonify({
@@ -289,10 +300,6 @@ def home():
         "message": "SAMP Reporter AI is running"
     })
 
-
-# ==========================================
-# GRAMMAR - STREAMING TASK
-# ==========================================
 
 @app.route("/check_grammar/start", methods=["POST"])
 def check_grammar_start():
@@ -333,10 +340,6 @@ def check_grammar_start():
         logger.exception("Grammar error")
         return error_response("Не удалось запустить проверку")
 
-
-# ==========================================
-# PR - STREAMING TASK
-# ==========================================
 
 @app.route("/generate_pr/start", methods=["POST"])
 def generate_pr_start():
@@ -379,7 +382,7 @@ def generate_pr_start():
 
         return start_task(
             "pr",
-            "Ты профессиональный автор PR-текстов. " +
+            "Ты профессиональный автор PR-текстов. "
             "Возвращай только готовый текст.",
             [{"role": "user", "parts": [{"text": prompt}]}],
             temperature=1.0,
@@ -391,10 +394,6 @@ def generate_pr_start():
         logger.exception("PR start error")
         return error_response("Не удалось начать генерацию PR")
 
-
-# ==========================================
-# CHAT - STREAMING TASK
-# ==========================================
 
 @app.route("/chat/start", methods=["POST"])
 def chat_start():
@@ -463,10 +462,6 @@ def chat_start():
         return error_response("Не удалось начать общение с ИИ")
 
 
-# ==========================================
-# TASK POLLING
-# ==========================================
-
 @app.route("/task/<task_id>", methods=["GET"])
 def task_status(task_id):
     task = get_task(task_id)
@@ -480,10 +475,6 @@ def task_status(task_id):
         "error": task["error"]
     })
 
-
-# ==========================================
-# START
-# ==========================================
 
 if __name__ == "__main__":
     app.run(
