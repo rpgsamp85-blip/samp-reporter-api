@@ -1,4 +1,3 @@
-
 import os
 import json
 import uuid
@@ -73,13 +72,10 @@ def get_task(task_id):
         return dict(task) if task else None
 
 
-def stream_gemini(
-    system_instruction,
-    contents,
-    temperature=0.8,
-    max_tokens=2000,
-    on_text=None
-):
+def stream_gemini(system_instruction, contents,
+                  temperature=0.8, max_tokens=2000,
+                  on_text=None):
+
     if not API_KEY:
         raise RuntimeError("На сервере не задан GEMINI_API_KEY")
 
@@ -167,6 +163,7 @@ def stream_gemini(
                         if chunk:
                             result += chunk
 
+                            # Сразу обновляем текст задачи
                             if on_text:
                                 on_text(result)
 
@@ -192,14 +189,9 @@ def stream_gemini(
     raise RuntimeError(last_error)
 
 
-def run_task(
-    task_id,
-    system,
-    contents,
-    temperature,
-    max_tokens,
-    validator=None
-):
+def run_task(task_id, system, contents,
+             temperature, max_tokens, validator=None):
+
     try:
         def on_text(text):
             update_task(task_id, text=text)
@@ -231,14 +223,10 @@ def run_task(
         )
 
 
-def start_task(
-    task_type,
-    system,
-    contents,
-    temperature=0.8,
-    max_tokens=2000,
-    validator=None
-):
+def start_task(task_type, system, contents,
+               temperature=0.8, max_tokens=2000,
+               validator=None):
+
     task_id = create_task(task_type)
 
     executor.submit(
@@ -312,8 +300,6 @@ def home():
     })
 
 
-# GRAMMAR
-
 @app.route("/check_grammar/start", methods=["POST"])
 def check_grammar_start():
     try:
@@ -353,8 +339,6 @@ def check_grammar_start():
         logger.exception("Grammar error")
         return error_response("Не удалось запустить проверку")
 
-
-# PR GENERATOR
 
 @app.route("/generate_pr/start", methods=["POST"])
 def generate_pr_start():
@@ -410,8 +394,6 @@ def generate_pr_start():
         return error_response("Не удалось начать генерацию PR")
 
 
-# CHAT - REPORTER AI
-
 @app.route("/chat/start", methods=["POST"])
 def chat_start():
     try:
@@ -431,8 +413,6 @@ def chat_start():
 
         contents = []
 
-        # История только текущего чата.
-        # Берём последние 16 предыдущих сообщений.
         for item in history[-16:]:
             if not isinstance(item, dict):
                 continue
@@ -451,95 +431,28 @@ def chat_start():
                 "parts": [{"text": content[:3000]}]
             })
 
-        # Добавляем текущее сообщение один раз.
         contents.append({
             "role": "user",
             "parts": [{"text": message}]
         })
 
         system = """
-Ты — Reporter Helper AI, профессиональный помощник ведущего
-радиоэфиров и репортёра на SA-MP.
+Ты настоящий универсальный ИИ-собеседник.
 
-ТВОЯ ГЛАВНАЯ ЗАДАЧА:
-Помогать ведущему создавать интересные, красивые и
-оригинальные сообщения для радиоэфиров.
-
-ТВОИ ВОЗМОЖНОСТИ:
-
-1. СООБЩЕНИЯ О ПЕРЕВОДАХ
-
-Если пользователь сообщает данные о переводе,
-составь красивое сообщение для эфира.
-
-Сохраняй точные ники, суммы и названия фракций.
-Не придумывай отсутствующие данные.
-
-2. ЕСЛИ ПЕРЕВОДОВ НЕТ
-
-Если пользователь говорит, что переводов нет,
-или просит подготовить эфир без переводов,
-самостоятельно создай оригинальный PR-текст.
-
-Сделай его интересным, ярким и подходящим для радиоэфира.
-
-Не упоминай несуществующие переводы.
-Не создавай вымышленные истории о реальных игроках.
-Не выдавай придуманные события за настоящие.
-
-3. PR-СООБЩЕНИЯ
-
-Создавай красивые рекламные и информационные тексты.
-
-Используй выразительные фразы, интересное начало
-и подходящее завершение.
-
-Каждый новый вариант должен отличаться от предыдущего.
-
-4. ОБЪЯВЛЕНИЯ
-
-Помогай составлять объявления для игроков,
-новости фракций и информационные сообщения.
-
-5. ПОМОЩЬ ВЕДУЩЕМУ
-
-Помогай ведущему во время подготовки и проведения эфиров.
-Предлагай идеи для тем, вступлений и завершений эфира.
-
-6. ОБЫЧНОЕ ОБЩЕНИЕ
-
-Отвечай на вопросы пользователя.
-Не превращай каждый ответ в PR.
-
-ПРАВИЛА:
-
-- Общайся на русском языке, если не попросили другой.
-- Учитывай историю текущего диалога.
-- Не выдумывай переводы, суммы, ники и события.
-- Если данных недостаточно, задай короткий уточняющий вопрос.
-- Если просят готовый текст, возвращай сразу готовый текст.
-- Не добавляй объяснения к готовому PR без необходимости.
-- Используй эмодзи умеренно и уместно.
-- Не повторяй постоянно одинаковые фразы.
-- Не упоминай Python, Lua и технические детали без запроса.
-- Не возвращай JSON или программный код без запроса.
-
-ВАЖНО:
-
-Если пользователь пишет, что переводов нет,
-не задавай лишних вопросов.
-Сразу придумай оригинальный PR для эфира,
-который можно использовать как готовое сообщение.
-
-Ты — помощник репортёра, который помогает вести
-интересные и качественные эфиры на SA-MP.
+- Общайся естественно.
+- Отвечай на вопросы по существу.
+- Учитывай историю разговора.
+- Помогай с Python, Lua, MoonLoader и SA-MP.
+- Не выдумывай факты.
+- Не добавляй JSON и технические метаданные.
+- Отвечай на русском языке, если не попросили другой.
 """
 
         return start_task(
             "chat",
             system,
             contents,
-            temperature=0.9,
+            temperature=0.8,
             max_tokens=2000
         )
 
@@ -547,8 +460,6 @@ def chat_start():
         logger.exception("Chat start error")
         return error_response("Не удалось начать общение с ИИ")
 
-
-# TASK STATUS
 
 @app.route("/task/<task_id>", methods=["GET"])
 def task_status(task_id):
