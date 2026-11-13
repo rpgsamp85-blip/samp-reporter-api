@@ -1,182 +1,76 @@
 
 import os
 import json
+import uuid
 import logging
+import threading
 import requests
 
+from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 16 * 1024
+app.config["MAX_CONTENT_LENGTH"] = 128 * 1024
 app.json.ensure_ascii = False
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("main")
+logger = logging.getLogger("reporter_ai")
 
 API_KEY = os.getenv("GEMINI_API_KEY")
-
 MAIN_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 BACKUP_MODEL = os.getenv("GEMINI_BACKUP_MODEL", "gemini-3.5-flash-lite")
 
-TIMEOUT = 60
+TIMEOUT = 90
+executor = ThreadPoolExecutor(max_workers=4)
+
+tasks = {}
+tasks_lock = threading.Lock()
 
 SYSTEM_INSTRUCTION = """
 Ты универсальный ИИ-помощник.
 Отвечай на русском языке, если пользователь не попросил другой язык.
-Выполняй поставленную задачу точно.
+Выполняй задачу точно.
 """
 
 
-def request_gemini(payload, json_mode=True):
+def update_task(task_id, **values):
+    with tasks_lock:
+        if task_id in tasks:
+            tasks[task_id].update(values)
+
+
+def create_task(task_type):
+    task_id = str(uuid.uuid4())
+
+    with tasks_lock:
+        tasks[task_id] = {
+            "id": task_id,
+            "type": task_type,
+            "status": "running",
+            "text": "",
+            "error": None
+        }
+
+    return task_id
+
+
+def get_task(task_id):
+    with tasks_lock:
+        task = tasks.get(task_id)
+
+        if task is None:
+            return None
+
+        return dict(task)
+
+
+def stream_gemini(system_instruction, contents, temperature=0.8,
+                  max_tokens=2000, on_text=None):
     if not API_KEY:
-        raise ValueError("На сервере не задан GEMINI_API_KEY")
+        raise RuntimeError("На сервере не задан GEMINI_API_KEY")
 
     models = [MAIN_MODEL, BACKUP_MODEL]
-    last_error = "Не удалось получить ответ от AI"
-
-    for model in models:
-        url = (
-            "https://generativelanguage.googleapis.com/"
-            f"v1beta/models/{model}:generateContent"
-        )
-
-        try:
-            logger.info("AI request: %s", model)
-
-            response = requests.post(
-                url,
-                params={"key": API_KEY},
-                json=payload,
-                timeout=(5, TIMEOUT)
-            )
-
-            if response.status_code != 200:
-                last_error = (
-                    f"Gemini HTTP {response.status_code}: "
-                    f"{response.text[:500]}"
-                )
-
-                logger.error("%s: %s", model, last_error)
-
-                if response.status_code in (404, 429, 503):
-                    continue
-
-                raise RuntimeError(last_error)
-
-            data = response.json()
-            candidates = data.get("candidates", [])
-
-            if not candidates:
-                last_error = "Gemini вернул пустой ответ"
-                continue
-
-            parts = candidates[0].get(
-                "content", {}
-            ).get("parts", [])
-
-            result = "".join(
-                part.get("text", "")
-                for part in parts
-            ).strip()
-
-            if not result:
-                last_error = "Gemini вернул пустой текст"
-                continue
-
-            if json_mode:
-                if result.startswith("```"):
-                    result = result.replace("```json", "", 1)
-                    result = result.replace("```", "").strip()
-
-                parsed = json.loads(result)
-
-                if not isinstance(parsed, dict):
-                    raise ValueError("AI вернул некорректный JSON")
-
-                return parsed
-
-            return result
-
-        except requests.Timeout:
-            last_error = f"Тайм-аут модели {model}"
-            logger.error(last_error)
-            continue
-
-        except requests.RequestException as e:
-            last_error = str(e)
-            logger.exception("Connection error: %s", model)
-            continue
-
-        except (ValueError, KeyError, TypeError) as e:
-            last_error = str(e)
-            logger.exception("Invalid AI response: %s", model)
-            continue
-
-    raise RuntimeError(last_error)
-
-
-def ask_ai(prompt, temperature=0.7, max_tokens=1500):
-    payload = {
-        "systemInstruction": {
-            "parts": [{"text": SYSTEM_INSTRUCTION}]
-        },
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": prompt}]
-            }
-        ],
-        "generationConfig": {
-            "temperature": temperature,
-            "maxOutputTokens": max_tokens,
-            "responseMimeType": "application/json"
-        }
-    }
-
-    return request_gemini(payload, json_mode=True)
-
-
-def ask_chat_ai(message, history):
-    system_instruction = """
-Ты настоящий универсальный ИИ-собеседник.
-
-Правила:
-- Общайся естественно, как обычный человек.
-- Если тебе пишут «Привет», просто поздоровайся.
-- Поддерживай нормальный разговор.
-- Отвечай на вопросы, а не выдавай случайные заготовки.
-- Помогай с Python, Lua, MoonLoader, SA-MP и другими темами.
-- Учитывай предыдущие сообщения.
-- Не выдумывай факты.
-- Не повторяй постоянно одни и те же приветствия.
-- Не добавляй JSON и технические метаданные.
-- Отвечай на русском языке.
-"""
-
-    contents = []
-
-    for item in history[-16:]:
-        if not isinstance(item, dict):
-            continue
-
-        role = item.get("role")
-        content = item.get("content")
-
-        if role not in ("user", "assistant"):
-            continue
-
-        if not isinstance(content, str) or not content.strip():
-            continue
-
-        contents.append({
-            "role": "user" if role == "user" else "model",
-            "parts": [{"text": content[:3000]}]
-        })
-
-    contents.append({
-        "role": "user",
-        "parts": [{"text": message}]
-    })
+    last_error = "Не удалось получить ответ Gemini"
 
     payload = {
         "systemInstruction": {
@@ -184,12 +78,199 @@ def ask_chat_ai(message, history):
         },
         "contents": contents,
         "generationConfig": {
-            "temperature": 0.8,
-            "maxOutputTokens": 2000
+            "temperature": temperature,
+            "maxOutputTokens": max_tokens
         }
     }
 
-    return request_gemini(payload, json_mode=False)
+    for model in models:
+        url = (
+            "https://generativelanguage.googleapis.com/"
+            f"v1beta/models/{model}:streamGenerateContent"
+        )
+
+        result = ""
+
+        try:
+            logger.info("Streaming Gemini request: %s", model)
+
+            with requests.post(
+                url,
+                params={"key": API_KEY, "alt": "sse"},
+                json=payload,
+                stream=True,
+                timeout=(10, TIMEOUT)
+            ) as response:
+
+                if response.status_code != 200:
+                    last_error = (
+                        f"Gemini HTTP {response.status_code}: "
+                        f"{response.text[:400]}"
+                    )
+                    logger.error("%s", last_error)
+
+                    if response.status_code in (404, 429, 500, 503):
+                        continue
+
+                    raise RuntimeError(last_error)
+
+                for line in response.iter_lines(decode_unicode=True):
+                    if not line:
+                        continue
+
+                    if isinstance(line, bytes):
+                        line = line.decode("utf-8", errors="replace")
+
+                    line = line.strip()
+
+                    if not line.startswith("data:"):
+                        continue
+
+                    raw = line[5:].strip()
+
+                    if not raw or raw == "[DONE]":
+                        continue
+
+                    try:
+                        packet = json.loads(raw)
+                    except json.JSONDecodeError:
+                        logger.warning("Invalid Gemini stream packet")
+                        continue
+
+                    candidates = packet.get("candidates", [])
+                    if not candidates:
+                        continue
+
+                    parts = (
+                        candidates[0]
+                        .get("content", {})
+                        .get("parts", [])
+                    )
+
+                    for part in parts:
+                        chunk = part.get("text", "")
+
+                        if chunk:
+                            result += chunk
+
+                            if on_text:
+                                on_text(result)
+
+            result = result.strip()
+
+            if result:
+                return result
+
+            last_error = "Gemini вернул пустой ответ"
+
+        except requests.Timeout:
+            last_error = f"Тайм-аут модели {model}"
+            logger.exception(last_error)
+
+        except requests.RequestException as exc:
+            last_error = str(exc)
+            logger.exception("Gemini connection error")
+
+        except Exception as exc:
+            last_error = str(exc)
+            logger.exception("Gemini generation error")
+
+    raise RuntimeError(last_error)
+
+
+def run_task(task_id, system_instruction, contents,
+             temperature=0.8, max_tokens=2000,
+             validator=None):
+    try:
+        def on_text(current_text):
+            update_task(task_id, text=current_text)
+
+        result = stream_gemini(
+            system_instruction,
+            contents,
+            temperature,
+            max_tokens,
+            on_text
+        )
+
+        if validator:
+            result = validator(result)
+
+        if not isinstance(result, str) or not result.strip():
+            raise ValueError("ИИ вернул пустой текст")
+
+        update_task(
+            task_id,
+            text=result.strip(),
+            status="done"
+        )
+
+    except Exception as exc:
+        logger.exception("Task %s failed", task_id)
+
+        update_task(
+            task_id,
+            status="error",
+            error=str(exc)
+        )
+
+
+def start_task(task_type, system_instruction, contents,
+               temperature=0.8, max_tokens=2000,
+               validator=None):
+    task_id = create_task(task_type)
+
+    executor.submit(
+        run_task,
+        task_id,
+        system_instruction,
+        contents,
+        temperature,
+        max_tokens,
+        validator
+    )
+
+    return jsonify({
+        "status": "success",
+        "task_id": task_id
+    })
+
+
+def clean_pr(text):
+    text = text.strip()
+
+    # Убираем случайные Markdown-блоки.
+    if text.startswith("```"):
+        lines = text.splitlines()
+
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+
+        text = "\n".join(lines).strip()
+
+    # Не допускаем выдачу исходного программного кода.
+    forbidden = [
+        "from flask import",
+        "import os",
+        "import requests",
+        "def generate_pr",
+        "def ask_ai",
+        "app = Flask",
+        "app.run(",
+        "def request_gemini",
+        "GEMINI_API_KEY",
+        "```python"
+    ]
+
+    lowered = text.lower()
+
+    if any(item.lower() in lowered for item in forbidden):
+        raise ValueError("Gemini вернул код вместо PR")
+
+    return text
 
 
 def error_response(message, status=502):
@@ -204,19 +285,19 @@ def get_data():
 
 
 # ==========================================
-# 1. CONNECTION CHECK
+# HOME
 # ==========================================
 
 @app.route("/", methods=["GET", "POST"])
 def home():
     return jsonify({
         "status": "online",
-        "message": "SAMP Reporter AI is running!"
+        "message": "SAMP Reporter AI is running"
     })
 
 
 # ==========================================
-# 2. GRAMMAR
+# GRAMMAR
 # ==========================================
 
 @app.route("/check_grammar", methods=["POST"])
@@ -232,36 +313,29 @@ def check_grammar():
             return error_response("Текст слишком длинный", 400)
 
         prompt = f"""
-Исправь орфографию, грамматику и пунктуацию текста.
+Исправь орфографию, грамматику и пунктуацию.
 
 Правила:
 - Сохрани первоначальный смысл.
 - Сохрани стиль автора.
 - Не добавляй новых фактов.
-- Не добавляй пояснения.
-- Не сокращай текст без необходимости.
+- Не добавляй пояснений.
+- Верни только исправленный текст.
 
 Текст:
 {text}
-
-Верни JSON строго такого вида:
-{{"corrected":"исправленный текст"}}
 """
 
-        result = ask_ai(
-            prompt,
+        result = stream_gemini(
+            SYSTEM_INSTRUCTION,
+            [{"role": "user", "parts": [{"text": prompt}]}],
             temperature=0.2,
             max_tokens=3000
         )
 
-        corrected = result.get("corrected")
-
-        if not isinstance(corrected, str) or not corrected.strip():
-            raise ValueError("AI вернул некорректный текст")
-
         return jsonify({
             "status": "success",
-            "corrected": corrected.strip()
+            "corrected": result.strip()
         })
 
     except Exception:
@@ -270,11 +344,11 @@ def check_grammar():
 
 
 # ==========================================
-# 3. PR GENERATOR
+# PR START
 # ==========================================
 
-@app.route("/generate_pr", methods=["POST"])
-def generate_pr():
+@app.route("/generate_pr/start", methods=["POST"])
+def generate_pr_start():
     try:
         data = get_data()
 
@@ -283,85 +357,60 @@ def generate_pr():
         event = str(data.get("event", "")).strip()
         fraction = str(data.get("fraction", "")).strip()
 
-        if not all([name, amount, fraction]):
+        if not name or not amount or not fraction:
             return error_response(
                 "Укажите ник, сумму и фракцию",
                 400
             )
 
         prompt = f"""
-Создай один красивый, эффектный PR-текст
-для игрового SA-MP проекта.
+Напиши готовый рекламный PR для игрового SA-MP проекта.
 
-Данные:
+Исходные данные:
 Фракция: {fraction}
 Ник игрока: {name}
 Сумма перевода: {amount}
-Повод или мероприятие: {event if event else "Не указан"}
+Мероприятие: {event if event else "Не указано"}
 
-СТИЛЬ:
-- Начни с яркой и цепляющей фразы.
-- Красиво представь фракцию и игрока.
-- Обязательно укажи точную сумму перевода.
-- Добавь 2-3 горячие, эмоциональные фразы.
-- Используй выразительные слова, например:
-  «Вот это размах!», «Настоящая щедрость!»,
-  «Такой поступок заслуживает внимания!»
-- Не копируй эти примеры дословно каждый раз.
-- Заверши красивой благодарностью.
-- Можно использовать несколько уместных эмодзи.
-- Текст должен выглядеть как готовое объявление,
-  а не как сухой отчёт.
-- Не придумывай дополнительные факты.
-- Не меняй ник, сумму и название фракции.
-- Не добавляй пояснений от себя.
+Требования:
+- Самостоятельно придумай оригинальную подачу.
+- Сделай красивое начало, основной текст и завершение.
+- Обязательно укажи точные ник, фракцию и сумму.
+- Добавь несколько эмоциональных, выразительных фраз.
+- Используй абзацы и естественные переносы строк.
+- Можно добавить уместные эмодзи.
+- Не выдумывай дополнительные факты.
+- Не меняй исходные данные.
+- Не используй одинаковый шаблон для каждого запроса.
+- Не пиши инструкций, пояснений или комментариев.
+- Не возвращай JSON.
+- Не возвращай программный код.
+- Не используй Markdown-блоки кода.
 
-Каждый запрос должен создавать новую оригинальную подачу.
-
-Верни JSON:
-{{"pr":"готовый PR-текст"}}
+Верни только готовый PR-текст.
 """
 
-        result = ask_ai(
-            prompt,
+        return start_task(
+            "pr",
+            "Ты профессиональный автор рекламных текстов. " +
+            "Возвращай только готовый PR, без кода и пояснений.",
+            [{"role": "user", "parts": [{"text": prompt}]}],
             temperature=1.0,
-            max_tokens=1500
+            max_tokens=1200,
+            validator=clean_pr
         )
 
-        pr = result.get("pr")
-
-        if not isinstance(pr, str) or not pr.strip():
-            raise ValueError("AI не вернул PR")
-
-        pr = pr.strip()
-
-        forbidden = [
-            "from flask import",
-            "import os",
-            "def generate_pr",
-            "app = Flask",
-            "def ask_ai"
-        ]
-
-        if any(word in pr for word in forbidden):
-            raise ValueError("AI вернул код вместо PR")
-
-        return jsonify({
-            "status": "success",
-            "pr": pr
-        })
-
     except Exception:
-        logger.exception("PR generation error")
-        return error_response("Не удалось сгенерировать PR")
+        logger.exception("PR start error")
+        return error_response("Не удалось начать генерацию PR")
 
 
 # ==========================================
-# 4. REAL AI CHAT
+# CHAT START
 # ==========================================
 
-@app.route("/chat", methods=["POST"])
-def chat():
+@app.route("/chat/start", methods=["POST"])
+def chat_start():
     try:
         data = get_data()
 
@@ -377,19 +426,72 @@ def chat():
         if not isinstance(history, list):
             history = []
 
-        reply = ask_chat_ai(message, history)
+        contents = []
 
-        if not isinstance(reply, str) or not reply.strip():
-            raise ValueError("ИИ вернул пустой ответ")
+        for item in history[-16:]:
+            if not isinstance(item, dict):
+                continue
 
-        return jsonify({
-            "status": "success",
-            "reply": reply.strip()
+            role = item.get("role")
+            content = item.get("content")
+
+            if role not in ("user", "assistant"):
+                continue
+
+            if not isinstance(content, str) or not content.strip():
+                continue
+
+            contents.append({
+                "role": "user" if role == "user" else "model",
+                "parts": [{"text": content[:3000]}]
+            })
+
+        contents.append({
+            "role": "user",
+            "parts": [{"text": message}]
         })
 
+        system = """
+Ты настоящий универсальный ИИ-собеседник.
+
+- Общайся естественно.
+- Отвечай на вопросы по существу.
+- Учитывай историю разговора.
+- Помогай с Python, Lua, MoonLoader и SA-MP.
+- Не выдавай случайные заготовки.
+- Не добавляй JSON и технические метаданные.
+- Отвечай на русском языке, если не попросили другой.
+"""
+
+        return start_task(
+            "chat",
+            system,
+            contents,
+            temperature=0.8,
+            max_tokens=2000
+        )
+
     except Exception:
-        logger.exception("Chat error")
-        return error_response("Не удалось получить ответ от ИИ")
+        logger.exception("Chat start error")
+        return error_response("Не удалось начать общение с ИИ")
+
+
+# ==========================================
+# TASK STATUS / STREAM POLLING
+# ==========================================
+
+@app.route("/task/<task_id>", methods=["GET"])
+def task_status(task_id):
+    task = get_task(task_id)
+
+    if task is None:
+        return error_response("Задача не найдена", 404)
+
+    return jsonify({
+        "status": task["status"],
+        "text": task["text"],
+        "error": task["error"]
+    })
 
 
 # ==========================================
@@ -399,5 +501,6 @@ def chat():
 if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
-        port=8080
+        port=8080,
+        threaded=True
     )
