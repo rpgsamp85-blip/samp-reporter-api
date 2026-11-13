@@ -18,7 +18,7 @@ API_KEY = os.getenv("GEMINI_API_KEY")
 MAIN_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 BACKUP_MODEL = os.getenv("GEMINI_BACKUP_MODEL", "gemini-3.5-flash-lite")
 
-TIMEOUT = 30
+TIMEOUT = 60
 
 SYSTEM_INSTRUCTION = """
 Ты универсальный ИИ-помощник.
@@ -27,7 +27,7 @@ SYSTEM_INSTRUCTION = """
 """
 
 
-def ask_ai(prompt, temperature=0.7, max_tokens=1500):
+def request_gemini(payload, json_mode=True):
     if not API_KEY:
         raise ValueError("На сервере не задан GEMINI_API_KEY")
 
@@ -39,23 +39,6 @@ def ask_ai(prompt, temperature=0.7, max_tokens=1500):
             "https://generativelanguage.googleapis.com/"
             f"v1beta/models/{model}:generateContent"
         )
-
-        payload = {
-            "systemInstruction": {
-                "parts": [{"text": SYSTEM_INSTRUCTION}]
-            },
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [{"text": prompt}]
-                }
-            ],
-            "generationConfig": {
-                "temperature": temperature,
-                "maxOutputTokens": max_tokens,
-                "responseMimeType": "application/json"
-            }
-        }
 
         try:
             logger.info("AI request: %s", model)
@@ -72,20 +55,19 @@ def ask_ai(prompt, temperature=0.7, max_tokens=1500):
                     f"Gemini HTTP {response.status_code}: "
                     f"{response.text[:500]}"
                 )
+
                 logger.error("%s: %s", model, last_error)
 
-                if response.status_code in (429, 503, 404):
+                if response.status_code in (404, 429, 503):
                     continue
 
                 raise RuntimeError(last_error)
 
             data = response.json()
-
             candidates = data.get("candidates", [])
 
             if not candidates:
                 last_error = "Gemini вернул пустой ответ"
-                logger.error(last_error)
                 continue
 
             parts = candidates[0].get(
@@ -101,13 +83,19 @@ def ask_ai(prompt, temperature=0.7, max_tokens=1500):
                 last_error = "Gemini вернул пустой текст"
                 continue
 
-            parsed = json.loads(result)
+            if json_mode:
+                if result.startswith("```"):
+                    result = result.replace("```json", "", 1)
+                    result = result.replace("```", "").strip()
 
-            if not isinstance(parsed, dict):
-                raise ValueError("AI вернул некорректный JSON")
+                parsed = json.loads(result)
 
-            logger.info("AI response successful: %s", model)
-            return parsed
+                if not isinstance(parsed, dict):
+                    raise ValueError("AI вернул некорректный JSON")
+
+                return parsed
+
+            return result
 
         except requests.Timeout:
             last_error = f"Тайм-аут модели {model}"
@@ -125,6 +113,83 @@ def ask_ai(prompt, temperature=0.7, max_tokens=1500):
             continue
 
     raise RuntimeError(last_error)
+
+
+def ask_ai(prompt, temperature=0.7, max_tokens=1500):
+    payload = {
+        "systemInstruction": {
+            "parts": [{"text": SYSTEM_INSTRUCTION}]
+        },
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": prompt}]
+            }
+        ],
+        "generationConfig": {
+            "temperature": temperature,
+            "maxOutputTokens": max_tokens,
+            "responseMimeType": "application/json"
+        }
+    }
+
+    return request_gemini(payload, json_mode=True)
+
+
+def ask_chat_ai(message, history):
+    system_instruction = """
+Ты настоящий универсальный ИИ-собеседник.
+
+Правила:
+- Общайся естественно, как обычный человек.
+- Если тебе пишут «Привет», просто поздоровайся.
+- Поддерживай нормальный разговор.
+- Отвечай на вопросы, а не выдавай случайные заготовки.
+- Помогай с Python, Lua, MoonLoader, SA-MP и другими темами.
+- Учитывай предыдущие сообщения.
+- Не выдумывай факты.
+- Не повторяй постоянно одни и те же приветствия.
+- Не добавляй JSON и технические метаданные.
+- Отвечай на русском языке.
+"""
+
+    contents = []
+
+    for item in history[-16:]:
+        if not isinstance(item, dict):
+            continue
+
+        role = item.get("role")
+        content = item.get("content")
+
+        if role not in ("user", "assistant"):
+            continue
+
+        if not isinstance(content, str) or not content.strip():
+            continue
+
+        contents.append({
+            "role": "user" if role == "user" else "model",
+            "parts": [{"text": content[:3000]}]
+        })
+
+    contents.append({
+        "role": "user",
+        "parts": [{"text": message}]
+    })
+
+    payload = {
+        "systemInstruction": {
+            "parts": [{"text": system_instruction}]
+        },
+        "contents": contents,
+        "generationConfig": {
+            "temperature": 0.8,
+            "maxOutputTokens": 2000
+        }
+    }
+
+    return request_gemini(payload, json_mode=False)
 
 
 def error_response(message, status=502):
@@ -151,7 +216,7 @@ def home():
 
 
 # ==========================================
-# 2. GRAMMAR CHECK
+# 2. GRAMMAR
 # ==========================================
 
 @app.route("/check_grammar", methods=["POST"])
@@ -173,8 +238,8 @@ def check_grammar():
 - Сохрани первоначальный смысл.
 - Сохрани стиль автора.
 - Не добавляй новых фактов.
+- Не добавляй пояснения.
 - Не сокращай текст без необходимости.
-- Не добавляй пояснения от себя.
 
 Текст:
 {text}
@@ -192,7 +257,7 @@ def check_grammar():
         corrected = result.get("corrected")
 
         if not isinstance(corrected, str) or not corrected.strip():
-            raise ValueError("AI вернул некорректный исправленный текст")
+            raise ValueError("AI вернул некорректный текст")
 
         return jsonify({
             "status": "success",
@@ -205,7 +270,7 @@ def check_grammar():
 
 
 # ==========================================
-# 3. GENERATE ONE PR
+# 3. PR GENERATOR
 # ==========================================
 
 @app.route("/generate_pr", methods=["POST"])
@@ -218,40 +283,48 @@ def generate_pr():
         event = str(data.get("event", "")).strip()
         fraction = str(data.get("fraction", "")).strip()
 
-        if not all([name, amount, event, fraction]):
-            return error_response("Заполните все поля", 400)
+        if not all([name, amount, fraction]):
+            return error_response(
+                "Укажите ник, сумму и фракцию",
+                400
+            )
 
         prompt = f"""
-Создай ОДИН оригинальный PR-текст на русском языке.
+Создай один красивый, эффектный PR-текст
+для игрового SA-MP проекта.
 
 Данные:
-Ник отправителя: {name}
+Фракция: {fraction}
+Ник игрока: {name}
 Сумма перевода: {amount}
-Мероприятие: {event}
-Фракция отправителя: {fraction}
+Повод или мероприятие: {event if event else "Не указан"}
 
-Требования:
-- Самостоятельно придумай интересную подачу.
-- Сделай текст выразительным, живым и подробным.
-- Используй креативное начало и запоминающееся завершение.
-- Органично упомяни предоставленные данные.
-- Благодари отправителя, если это уместно.
-- Не придумывай дополнительные факты, которых нет во входных данных.
-- Не используй готовые шаблоны.
-- Не копируй чужие тексты.
+СТИЛЬ:
+- Начни с яркой и цепляющей фразы.
+- Красиво представь фракцию и игрока.
+- Обязательно укажи точную сумму перевода.
+- Добавь 2-3 горячие, эмоциональные фразы.
+- Используй выразительные слова, например:
+  «Вот это размах!», «Настоящая щедрость!»,
+  «Такой поступок заслуживает внимания!»
+- Не копируй эти примеры дословно каждый раз.
+- Заверши красивой благодарностью.
+- Можно использовать несколько уместных эмодзи.
+- Текст должен выглядеть как готовое объявление,
+  а не как сухой отчёт.
+- Не придумывай дополнительные факты.
+- Не меняй ник, сумму и название фракции.
 - Не добавляй пояснений от себя.
-- Не навязывай строгий стиль репортёров.
-- Не учитывай RP-ограничения при творческой подаче.
 
-Каждый новый запрос должен создавать новый, отличающийся текст.
+Каждый запрос должен создавать новую оригинальную подачу.
 
-Верни JSON строго такого вида:
-{{"pr":"полный текст PR"}}
+Верни JSON:
+{{"pr":"готовый PR-текст"}}
 """
 
         result = ask_ai(
             prompt,
-            temperature=0.9,
+            temperature=1.0,
             max_tokens=1500
         )
 
@@ -260,9 +333,22 @@ def generate_pr():
         if not isinstance(pr, str) or not pr.strip():
             raise ValueError("AI не вернул PR")
 
+        pr = pr.strip()
+
+        forbidden = [
+            "from flask import",
+            "import os",
+            "def generate_pr",
+            "app = Flask",
+            "def ask_ai"
+        ]
+
+        if any(word in pr for word in forbidden):
+            raise ValueError("AI вернул код вместо PR")
+
         return jsonify({
             "status": "success",
-            "pr": pr.strip()
+            "pr": pr
         })
 
     except Exception:
@@ -271,7 +357,7 @@ def generate_pr():
 
 
 # ==========================================
-# 4. AI CHAT
+# 4. REAL AI CHAT
 # ==========================================
 
 @app.route("/chat", methods=["POST"])
@@ -291,63 +377,10 @@ def chat():
         if not isinstance(history, list):
             history = []
 
-        conversation = []
-
-        for item in history[-12:]:
-            if not isinstance(item, dict):
-                continue
-
-            role = item.get("role")
-            content = item.get("content")
-
-            if role not in ("user", "assistant"):
-                continue
-
-            if not isinstance(content, str) or not content.strip():
-                continue
-
-            conversation.append(
-                f"{'Пользователь' if role == 'user' else 'ИИ'}: "
-                f"{content[:3000]}"
-            )
-
-        history_text = "\n".join(conversation)
-
-        prompt = f"""
-Ты общаешься с пользователем через чат внутри SA-MP.
-
-Твои задачи:
-- Отвечай на вопросы пользователя.
-- Помогай с Lua, Python, MoonLoader, SA-MP и другими темами.
-- Объясняй ошибки и помогай разбираться с кодом.
-- Учитывай предыдущую переписку.
-- Не выдумывай информацию.
-- Отвечай понятно и по существу.
-- Общайся естественно, без лишней официальности.
-- Если вопрос непонятен, попроси уточнение.
-
-Предыдущая переписка:
-{history_text if history_text else "Переписки пока нет."}
-
-Новое сообщение пользователя:
-{message}
-
-Ответь на последнее сообщение с учётом контекста.
-
-Верни JSON строго такого вида:
-{{"reply":"твой ответ пользователю"}}
-"""
-
-        result = ask_ai(
-            prompt,
-            temperature=0.7,
-            max_tokens=2000
-        )
-
-        reply = result.get("reply")
+        reply = ask_chat_ai(message, history)
 
         if not isinstance(reply, str) or not reply.strip():
-            raise ValueError("AI вернул пустой ответ")
+            raise ValueError("ИИ вернул пустой ответ")
 
         return jsonify({
             "status": "success",
