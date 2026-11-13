@@ -1,195 +1,189 @@
 
 import os
 import re
-import time
+import json
 import logging
+import requests
 
 from flask import Flask, request, jsonify
-from google import genai
-from google.genai import types
-
-# =====================================
-# REPORTER HELPER AI
-# =====================================
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024
 app.json.ensure_ascii = False
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("main")
+
+API_KEY = os.getenv("GEMINI_API_KEY")
 
 MAIN_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
-BACKUP_MODEL = "gemini-3.5-flash-lite"
+BACKUP_MODEL = os.getenv("GEMINI_BACKUP_MODEL", "gemini-3.5-flash-lite")
 
-SYSTEM_INSTRUCTION = (
-    "Ты помощник редактора SAMP. "
-    "Отвечай только на русском языке. "
-    "Точно выполняй задачу пользователя. "
-    "Не добавляй рекламу, ссылки и постороннюю информацию. "
-    "Не придумывай факты, имена и числа."
-)
+TIMEOUT = 15
 
+SYSTEM_INSTRUCTION = """
+Ты помощник для игроков SAMP.
+Отвечай строго по заданию.
+Не добавляй пояснения от себя.
+Всегда возвращай корректный JSON.
+Используй русский язык.
+"""
 
-# =====================================
-# JSON RESPONSE
-# =====================================
-
-def json_response(data, status=200):
-    response = jsonify(data)
-    response.status_code = status
-    response.headers["Content-Type"] = "application/json; charset=utf-8"
-    return response
-
-
-# =====================================
-# GEMINI REQUEST WITH FALLBACK
-# =====================================
 
 def ask_ai(prompt):
-    api_key = os.getenv("GEMINI_API_KEY")
+    if not API_KEY:
+        raise ValueError("На сервере не задан GEMINI_API_KEY")
 
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY не настроен в Railway")
+    models = [MAIN_MODEL, BACKUP_MODEL]
 
-    client = genai.Client(api_key=api_key)
+    last_error = "Не удалось получить ответ от AI"
 
-    models = [MAIN_MODEL]
-
-    if BACKUP_MODEL != MAIN_MODEL:
-        models.append(BACKUP_MODEL)
-
-    last_error = None
-
-    try:
-        for model in models:
-            for attempt in range(2):
-                try:
-                    logger.info(
-                        "Gemini request: model=%s attempt=%s",
-                        model,
-                        attempt + 1
-                    )
-
-                    response = client.models.generate_content(
-                        model=model,
-                        contents=prompt,
-                        config=types.GenerateContentConfig(
-                            system_instruction=SYSTEM_INSTRUCTION,
-                            max_output_tokens=1800,
-                            temperature=0.3
-                        )
-                    )
-
-                    result = response.text
-
-                    if not result or not result.strip():
-                        raise RuntimeError("Gemini вернул пустой ответ")
-
-                    logger.info("Gemini response successful: %s", model)
-
-                    return result.strip()
-
-                except Exception as error:
-                    last_error = error
-
-                    logger.exception(
-                        "Gemini failed: model=%s attempt=%s",
-                        model,
-                        attempt + 1
-                    )
-
-                    if attempt == 0:
-                        time.sleep(2)
-
-            logger.warning("Switching to backup model: %s", model)
-
-        raise RuntimeError(
-            f"Все модели Gemini недоступны: {last_error}"
+    for model in models:
+        url = (
+            "https://generativelanguage.googleapis.com/"
+            f"v1beta/models/{model}:generateContent"
         )
 
-    finally:
-        client.close()
+        payload = {
+            "systemInstruction": {
+                "parts": [{"text": SYSTEM_INSTRUCTION}]
+            },
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": prompt}]
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.2,
+                "maxOutputTokens": 1200,
+                "responseMimeType": "application/json"
+            }
+        }
 
+        try:
+            logger.info("AI request: %s", model)
 
-# =====================================
-# HOME
-# =====================================
+            response = requests.post(
+                url,
+                params={"key": API_KEY},
+                json=payload,
+                timeout=(5, TIMEOUT)
+            )
+
+            if response.status_code != 200:
+                last_error = (
+                    f"Gemini HTTP {response.status_code}: "
+                    f"{response.text[:500]}"
+                )
+                logger.error("%s: %s", model, last_error)
+
+                if response.status_code in (503, 429, 404):
+                    continue
+
+                raise RuntimeError(last_error)
+
+            data = response.json()
+
+            candidates = data.get("candidates", [])
+            if not candidates:
+                last_error = "Gemini вернул пустой ответ"
+                logger.error(last_error)
+                continue
+
+            parts = candidates[0].get("content", {}).get("parts", [])
+            result = "".join(
+                part.get("text", "") for part in parts
+            ).strip()
+
+            if not result:
+                last_error = "Gemini вернул пустой текст"
+                continue
+
+            parsed = json.loads(result)
+
+            logger.info("AI response successful: %s", model)
+            return parsed
+
+        except requests.Timeout:
+            last_error = f"Тайм-аут модели {model}"
+            logger.error(last_error)
+            continue
+
+        except requests.RequestException as e:
+            last_error = str(e)
+            logger.exception("Connection error: %s", model)
+            continue
+
+        except (ValueError, KeyError, TypeError) as e:
+            last_error = str(e)
+            logger.exception("Invalid AI response: %s", model)
+            continue
+
+    raise RuntimeError(last_error)
+
 
 @app.route("/", methods=["GET", "POST"])
 def home():
-    return json_response({
+    return jsonify({
         "status": "online",
         "message": "SAMP Reporter AI is running!"
     })
 
 
-# =====================================
-# GRAMMAR CHECK
-# =====================================
-
 @app.route("/check_grammar", methods=["POST"])
 def check_grammar():
     try:
-        data = request.get_json(silent=True)
+        data = request.get_json(silent=True) or {}
+        text = str(data.get("text", "")).strip()
 
-        if not isinstance(data, dict):
-            return json_response({
-                "status": "error",
-                "message": "Неверный формат запроса"
-            }, 400)
-
-        text = data.get("text", "")
-
-        if not isinstance(text, str) or not text.strip():
-            return json_response({
+        if not text:
+            return jsonify({
                 "status": "error",
                 "message": "Введите текст"
-            }, 400)
+            }), 400
 
-        if len(text) > 5000:
-            return json_response({
+        if len(text) > 3000:
+            return jsonify({
                 "status": "error",
                 "message": "Текст слишком длинный"
-            }, 400)
+            }), 400
 
-        prompt = (
-            "Исправь орфографию, грамматику и пунктуацию "
-            "следующего текста. Сохрани исходный смысл и стиль. "
-            "Верни только исправленный текст, без объяснений:\n\n"
-            + text
-        )
+        prompt = f"""
+Исправь грамматику и пунктуацию текста.
+Сохрани первоначальный смысл и стиль.
+Не добавляй новых предложений.
 
-        corrected = ask_ai(prompt)
+Текст:
+{text}
 
-        return json_response({
+Верни JSON строго такого вида:
+{{"corrected":"исправленный текст"}}
+"""
+
+        result = ask_ai(prompt)
+        corrected = result.get("corrected")
+
+        if not isinstance(corrected, str) or not corrected.strip():
+            raise ValueError("Некорректный ответ AI")
+
+        return jsonify({
             "status": "success",
-            "corrected": corrected
+            "corrected": corrected.strip()
         })
 
-    except Exception:
+    except Exception as e:
         logger.exception("Grammar error")
-
-        return json_response({
+        return jsonify({
             "status": "error",
-            "message": "ИИ временно недоступен. Попробуй позже."
-        }, 502)
+            "message": str(e)
+        }), 502
 
-
-# =====================================
-# PR GENERATOR
-# =====================================
 
 @app.route("/generate_pr", methods=["POST"])
 def generate_pr():
     try:
-        data = request.get_json(silent=True)
-
-        if not isinstance(data, dict):
-            return json_response({
-                "status": "error",
-                "message": "Неверный формат запроса"
-            }, 400)
+        data = request.get_json(silent=True) or {}
 
         name = str(data.get("name", "")).strip()
         amount = str(data.get("sum", "")).strip()
@@ -197,100 +191,56 @@ def generate_pr():
         fraction = str(data.get("fraction", "")).strip()
 
         if not all([name, amount, event, fraction]):
-            return json_response({
+            return jsonify({
                 "status": "error",
                 "message": "Заполните все поля"
-            }, 400)
+            }), 400
 
         prompt = f"""
-Создай ровно 3 разных RP-пиара для сервера SAMP.
+Создай 5 вариантов PR-сообщения для SAMP.
 
-ДАННЫЕ:
-Отправитель: {name}
-Сумма перевода: {amount}
+Ник: {name}
+Сумма: {amount}
 Мероприятие: {event}
-Фракция отправителя: {fraction}
+Фракция: {fraction}
 
-ТРЕБОВАНИЯ:
-1. Начинай каждый вариант по-разному.
-2. Укажи отправителя и его фракцию.
-3. Укажи точную сумму.
-4. Укажи название мероприятия.
-5. Пиши естественным русским языком.
-6. Используй немного эмоций.
-7. Не придумывай дополнительные факты.
-8. Не добавляй объяснения.
-9. Создай ровно три отдельных сообщения.
+Требования:
+- Пиши на русском языке.
+- Каждый вариант должен отличаться.
+- Не придумывай дополнительные факты.
+- Формулировки должны подходить для игрового RP-сервера.
 
-Разделяй варианты отдельной строкой:
----
-
-Верни ровно 3 варианта.
+Верни JSON строго такого вида:
+{{"templates":["вариант 1","вариант 2","вариант 3","вариант 4","вариант 5"]}}
 """
 
         result = ask_ai(prompt)
+        templates = result.get("templates")
+
+        if not isinstance(templates, list) or not templates:
+            raise ValueError("AI не вернул список шаблонов")
 
         templates = [
-            item.strip()
-            for item in re.split(r"(?m)^\s*---+\s*$", result)
-            if item.strip()
+            str(item).strip()
+            for item in templates
+            if str(item).strip()
         ]
 
-        if len(templates) != 3:
-            raise ValueError(
-                f"Ожидалось 3 варианта, получено: {len(templates)}"
-            )
+        if not templates:
+            raise ValueError("Шаблоны пустые")
 
-        return json_response({
+        return jsonify({
             "status": "success",
             "templates": templates
         })
 
-    except Exception:
+    except Exception as e:
         logger.exception("PR generation error")
-
-        return json_response({
+        return jsonify({
             "status": "error",
-            "message": "ИИ временно недоступен. Попробуй позже."
-        }, 502)
+            "message": str(e)
+        }), 502
 
-
-# =====================================
-# ERROR HANDLERS
-# =====================================
-
-@app.errorhandler(404)
-def not_found(error):
-    return json_response({
-        "status": "error",
-        "message": "Маршрут не найден"
-    }, 404)
-
-
-@app.errorhandler(413)
-def too_large(error):
-    return json_response({
-        "status": "error",
-        "message": "Запрос слишком большой"
-    }, 413)
-
-
-@app.errorhandler(Exception)
-def internal_error(error):
-    logger.exception("Unexpected server error")
-
-    return json_response({
-        "status": "error",
-        "message": "Внутренняя ошибка сервера"
-    }, 500)
-
-
-# =====================================
-# START
-# =====================================
 
 if __name__ == "__main__":
-    app.run(
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", 8080))
-    )
+    app.run(host="0.0.0.0", port=8080)
